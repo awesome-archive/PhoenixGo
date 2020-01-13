@@ -18,6 +18,7 @@
 #pragma once
 
 #include <vector>
+#include <functional>
 
 #include "common/errordef.h"
 
@@ -49,6 +50,8 @@ class ZeroModelBase
 
     virtual void Wait() {}
 
-    const static int INPUT_DIM  = 19 * 19 * 17;
-    const static int OUTPUT_DIM = 19 * 19 + 1;
+    enum {
+        INPUT_DIM  = 19 * 19 * 17,
+        OUTPUT_DIM = 19 * 19 + 1,
+    };
 };

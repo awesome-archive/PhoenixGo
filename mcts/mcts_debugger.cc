@@ -41,7 +41,9 @@ void MCTSDebugger::Debug() // call before move
         int ith = m_engine->m_num_moves + 1;
         std::string ith_str = std::to_string(ith) + "th move(" + "wb"[ith&1] + ")";
         VLOG(1) << "========== debug info for " << ith_str << " begin ==========";
-        VLOG(1) << "main move path: " << GetMainMovePath();
+        VLOG(1) << "main move path: " << GetMainMovePath(0);
+        VLOG(1) << "second move path: " << GetMainMovePath(1);
+        VLOG(1) << "third move path: " << GetMainMovePath(2);
         int depth = m_engine->GetConfig().debugger().print_tree_depth();
         int width = m_engine->GetConfig().debugger().print_tree_width();
         PrintTree(depth ? depth : 1, width ? width : 10);
@@ -55,10 +57,12 @@ std::string MCTSDebugger::GetDebugStr()
     TreeNode *root = m_engine->m_root;
     int ith = m_engine->m_num_moves;
     std::string ith_str = std::to_string(ith) + "th move(" + "wb"[ith&1] + ")";
+    float root_action = (float)root->total_action / k_action_value_base / root->visit_count;
     std::string debug_str =
         ith_str + ": " + GoFunction::IdToStr(root->move) +
+        ", winrate=" + std::to_string((root_action + 1) * 50) + "%" +
         ", N=" + std::to_string(root->visit_count) +
-        ", Q=" + std::to_string((float)root->total_action / k_action_value_base / root->visit_count) +
+        ", Q=" + std::to_string(root_action) +
         ", p=" + std::to_string(root->prior_prob) +
         ", v=" + std::to_string(root->value);
     if (m_engine->m_simulation_counter > 0) {
@@ -82,19 +86,17 @@ void MCTSDebugger::UpdateLastMoveDebugStr()
     m_last_move_debug_str = GetDebugStr();
 }
 
-std::string MCTSDebugger::GetMainMovePath()
+std::string MCTSDebugger::GetMainMovePath(int rank)
 {
     std::string moves;
     TreeNode *node = m_engine->m_root;
-    while (node->expand_state == k_expanded) {
+    while (node->expand_state == k_expanded && node->ch_len > rank) {
         TreeNode *ch = node->ch;
-        int ch_len = node->ch_len;
-        TreeNode *best_ch = ch;
-        for (int i = 0; i < ch_len; ++i) {
-            if (ch[i].visit_count > best_ch->visit_count) {
-                best_ch = &ch[i];
-            }
-        }
+        std::vector<int> idx(node->ch_len);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::nth_element(idx.begin(), idx.begin() + rank, idx.end(),
+                         [ch](int i, int j) { return ch[i].visit_count > ch[j].visit_count; });
+        TreeNode *best_ch = &ch[idx[rank]];
         if (moves.size()) moves += ",";
         moves += GoFunction::IdToStr(best_ch->move);
         char buf[100];
@@ -105,6 +107,7 @@ std::string MCTSDebugger::GetMainMovePath()
                  best_ch->value.load());
         moves += buf;
         node = best_ch;
+        rank = 0;
     }
     return moves;
 }

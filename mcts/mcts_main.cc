@@ -15,8 +15,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
 #include <sys/wait.h>
+#endif
 
 #include <boost/asio.hpp>
 #include <glog/logging.h>
@@ -37,7 +39,9 @@ DEFINE_string(init_moves, "", "Initialize Go board with init_moves.");
 DEFINE_bool(gtp, false, "Run as gtp server.");
 DEFINE_int32(listen_port, 0, "Listen which port.");
 DEFINE_string(allow_ip, "", "List of client ip allowed to connect, seperated by comma.");
+#if !defined(_WIN32) && !defined(_WIN64)
 DEFINE_bool(fork_per_request, true, "Fork for each request or not.");
+#endif
 
 const int k_handicaps_x[5] = {3, 15, 15, 3, 9};
 const int k_handicaps_y[5] = {3, 15, 3, 15, 9};
@@ -86,15 +90,6 @@ void ReloadConfig(MCTSEngine &engine, const std::string &config_path)
     }
 }
 
-void InitMoves(MCTSEngine &engine, const std::string &moves)
-{
-    for (size_t i = 0; i < moves.size(); i += 3) {
-        GoCoordId x, y;
-        GoFunction::StrToCoord(moves.substr(i, 2), x, y);
-        engine.Move(x, y);
-    }
-}
-
 std::string EncodeMove(GoCoordId x, GoCoordId y)
 {
     if (GoFunction::IsPass(x, y)) {
@@ -140,8 +135,11 @@ std::pair<bool, std::string> GTPExecute(MCTSEngine &engine, const std::string &c
     if (op == "version") {
         return {true, "1.0"};
     }
+    if (op == "protocol_version") {
+        return {true, "2"};
+    }
     if (op == "list_commands") {
-        return {true, "name\nversion\nlist_commands\nquit\nclear_board\nboardsize\nkomi\ntime_settings\ntime_left\nplace_free_handicap\nset_free_handicap\nplay\ngenmove\nfinal_score\nget_debug_info\nget_last_move_debug_info"};
+        return {true, "name\nversion\nprotocol_version\nlist_commands\nquit\nclear_board\nboardsize\nkomi\ntime_settings\ntime_left\nplace_free_handicap\nset_free_handicap\nplay\ngenmove\nfinal_score\nget_debug_info\nget_last_move_debug_info\nundo"};
     }
     if (op == "quit") {
         return {true, ""};
@@ -156,6 +154,7 @@ std::pair<bool, std::string> GTPExecute(MCTSEngine &engine, const std::string &c
         if (size != 19) {
             return {false, "unacceptable size"};
         }
+        engine.Reset();
         return {true, ""};
     }
     if (op == "komi") {
@@ -213,6 +212,7 @@ std::pair<bool, std::string> GTPExecute(MCTSEngine &engine, const std::string &c
             DecodeMove(move, x, y);
             engine.Move(x, y);
         }
+        return {true, ""};
     }
     if (op == "play") {
         ReloadConfig(engine, FLAGS_config_path);
@@ -224,6 +224,7 @@ std::pair<bool, std::string> GTPExecute(MCTSEngine &engine, const std::string &c
             engine.Move(-1, -1);
         }
         engine.Move(x, y);
+        std::cerr << engine.GetDebugger().GetLastMoveDebugStr() << std::endl;
         return {true, ""};
     }
     if (op == "genmove") {
@@ -236,6 +237,7 @@ std::pair<bool, std::string> GTPExecute(MCTSEngine &engine, const std::string &c
         GoCoordId x = -1, y = -1;
         engine.GenMove(x, y);
         engine.Move(x, y);
+        std::cerr << engine.GetDebugger().GetLastMoveDebugStr() << std::endl;
         return {true, EncodeMove(x, y)};
     }
     if (op == "final_score") {
@@ -248,6 +250,12 @@ std::pair<bool, std::string> GTPExecute(MCTSEngine &engine, const std::string &c
     if (op == "get_last_move_debug_info") {
         return {true, engine.GetDebugger().GetLastMoveDebugStr()};
     }
+    if (op == "undo") {
+        if (!engine.Undo()) {
+            return {false, "stack empty"};
+        }
+        return {true, ""};
+    }
     LOG(ERROR) << "invalid op: " << op;
     return {false, "unknown command"};
 }
@@ -255,7 +263,10 @@ std::pair<bool, std::string> GTPExecute(MCTSEngine &engine, const std::string &c
 void GTPServing(std::istream &in, std::ostream &out)
 {
     auto engine = InitEngine(FLAGS_config_path);
-    InitMoves(*engine, FLAGS_init_moves);
+    if (FLAGS_init_moves.size()) {
+        engine->Reset(FLAGS_init_moves);
+    }
+    std::cerr << std::flush;
 
     int id;
     bool has_id, succ;
@@ -263,7 +274,7 @@ void GTPServing(std::istream &in, std::ostream &out)
     while (std::getline(in, cmd)) {
         for (char &c: cmd) c = std::tolower(c);
         LOG(INFO) << "input cmd: " << cmd;
-        google::FlushLogFiles(google::INFO);
+        google::FlushLogFiles(google::GLOG_INFO);
 
         std::istringstream ss(cmd);
         if ((has_id = (bool)(ss >> id))) {
@@ -282,7 +293,7 @@ void GTPServing(std::istream &in, std::ostream &out)
         }
         out << std::endl << std::endl;
 
-        google::FlushLogFiles(google::INFO);
+        google::FlushLogFiles(google::GLOG_INFO);
 
         if (cmd.find("quit") != std::string::npos) {
             break;
@@ -294,7 +305,9 @@ void GTPServing(std::istream &in, std::ostream &out)
 void GenMoveOnce()
 {
     auto engine = InitEngine(FLAGS_config_path);
-    InitMoves(*engine, FLAGS_init_moves);
+    if (FLAGS_init_moves.size()) {
+        engine->Reset(FLAGS_init_moves);
+    }
 
     GoCoordId x, y;
     engine->GenMove(x, y);
@@ -324,6 +337,10 @@ void GTPServingOnPort(int port)
             continue;
         }
 
+#if defined(_WIN32) || defined(_WIN64)
+        stream.rdbuf()->set_option(asio::ip::tcp::socket::keep_alive(true));
+        GTPServing(stream, stream);
+#else
         if (FLAGS_fork_per_request) {
             int pid, fork_cnt;
             for (fork_cnt = 0; fork_cnt < 2; ++fork_cnt) {
@@ -349,14 +366,17 @@ void GTPServingOnPort(int port)
             stream.rdbuf()->set_option(asio::ip::tcp::socket::keep_alive(true));
             GTPServing(stream, stream);
         }
+#endif
     }
 }
 
 int main(int argc, char* argv[])
 {
-    gflags::ParseCommandLineFlags(&argc, &argv, true);
+    google::ParseCommandLineFlags(&argc, &argv, true);
     google::InitGoogleLogging(argv[0]);
+#if !defined(_WIN32) && !defined(_WIN64)
     google::InstallFailureSignalHandler();
+#endif
 
     if (FLAGS_gtp) {
         if (FLAGS_listen_port == 0) {

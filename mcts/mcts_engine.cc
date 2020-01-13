@@ -111,16 +111,23 @@ MCTSEngine::~MCTSEngine()
     LOG(INFO) << "~MCTSEngine: Deconstruct MCTSEngin succ";
 }
 
-void MCTSEngine::Reset()
+void MCTSEngine::Reset(const std::string &init_moves)
 {
     SearchPause();
     ChangeRoot(nullptr);
     m_board.CopyFrom(GoState(!m_config.disable_positional_superko()));
     m_simulation_counter = 0;
-    m_num_moves = 0;
-    m_moves_str.clear();
+    m_num_moves = (init_moves.size() + 1) / 3;
+    m_moves_str = init_moves;
     m_gen_passes = 0;
     m_byo_yomi_timer.Reset();
+
+    for (size_t i = 0; i < init_moves.size(); i += 3) {
+        GoCoordId x, y;
+        GoFunction::StrToCoord(init_moves.substr(i, 2), x, y);
+        m_board.Move(x, y);
+        m_root->move = GoFunction::CoordToId(x, y);
+    }
 
     if (m_config.enable_background_search()) {
         SearchResume();
@@ -144,7 +151,7 @@ void MCTSEngine::Move(GoCoordId x, GoCoordId y)
     }
 
     int ret = m_board.Move(x, y);
-    CHECK_EQ(ret, 0) << "Move: failed, " << GoFunction::CoordToId(x, y) << ", ret" << ret;
+    CHECK_EQ(ret, 0) << "Move: failed, " << GoFunction::CoordToStr(x, y) << ", ret" << ret;
 
     ++m_num_moves;
     if (m_moves_str.size()) m_moves_str += ",";
@@ -152,6 +159,7 @@ void MCTSEngine::Move(GoCoordId x, GoCoordId y)
     LOG(INFO) << "Move: " << m_moves_str;
 
     ChangeRoot(FindChild(m_root, GoFunction::CoordToId(x, y)));
+    m_root->move = GoFunction::CoordToId(x, y);
 
     m_debugger.UpdateLastMoveDebugStr();
     LOG(INFO) << m_debugger.GetLastMoveDebugStr();
@@ -163,6 +171,11 @@ void MCTSEngine::Move(GoCoordId x, GoCoordId y)
         m_config = *m_pending_config;
         m_pending_config = nullptr;
         LOG(INFO) << "reload config succ: \n" << m_config.DebugString();
+    }
+
+    if (!m_config.disable_double_pass_scoring() && m_board.IsDoublePass()) {
+        LOG(INFO) << "Move: double pass, game ends";
+        return;
     }
 
     if (m_config.enable_background_search()) {
@@ -211,6 +224,15 @@ void MCTSEngine::GenMove(GoCoordId &x, GoCoordId &y, std::vector<int> &visit_cou
     if (move == GoComm::COORD_PASS) {
         ++m_gen_passes;
     }
+}
+
+bool MCTSEngine::Undo()
+{
+    if (m_num_moves == 0) {
+        return false;
+    }
+    Reset(m_moves_str.substr(0, m_moves_str.size() - 3));
+    return true;
 }
 
 const GoState &MCTSEngine::GetBoard()
@@ -287,14 +309,14 @@ void MCTSEngine::Eval(const GoState &board, EvalCallback callback)
     int transform_mode = g_random_engine() & 7;
     TransformFeatures(features, transform_mode);
 
-    bool dumb_pass = board.GetLastMove() == GoComm::COORD_PASS && board.GetWinner() != board.CurrentPlayer();
+    bool dumb_pass = board.GetWinner() != board.CurrentPlayer();
 
     callback =
         [this, callback, timer, transform_mode, dumb_pass]
         (int ret, std::vector<float> policy, float value) {
             if (ret == 0) {
                 if (dumb_pass && value < 0.5 && !m_config.disable_double_pass_scoring()) {
-                    policy.back() = std::min(policy.back(), 1e-5f); // disallow second PASS
+                    policy.back() = std::min(policy.back(), 1e-5f); // disallow dumb PASS
                 }
 
                 CHECK_EQ(policy.size(), GoComm::GOBOARD_SIZE + 1)
@@ -436,9 +458,9 @@ TreeNode *MCTSEngine::SelectChild(TreeNode *node)
     TreeNode *ch = node->ch;
     int ch_len = node->ch_len;
     CHECK_GT(ch_len, 0);
-    int visit_count[ch_len];
-    float virtual_loss[ch_len];
-    float total_action[ch_len];
+    int visit_count[GoComm::GOBOARD_SIZE + 1];
+    float virtual_loss[GoComm::GOBOARD_SIZE + 1];
+    float total_action[GoComm::GOBOARD_SIZE + 1];
     for (int i = 0; i < ch_len; ++i) {
         visit_count[i] = ch[i].visit_count;
         virtual_loss[i] = ch[i].virtual_loss_count * m_config.virtual_loss();
@@ -601,8 +623,8 @@ bool MCTSEngine::CheckUnstable()
     }
     TreeNode *ch = m_root->ch;
     int ch_len = m_root->ch_len;
-    int visit_count[ch_len];
-    float mean_action[ch_len];
+    int visit_count[GoComm::GOBOARD_SIZE + 1];
+    float mean_action[GoComm::GOBOARD_SIZE + 1];
     for (int i = 0; i < ch_len; ++i) {
         visit_count[i] = ch[i].visit_count;
         mean_action[i] = visit_count[i] == 0 ? 0.0f :
@@ -790,7 +812,7 @@ void MCTSEngine::SearchRoutine()
     for (;;) {
         if (!m_search_threads_conductor.IsRunning()) {
             VLOG(2) << "SearchRoutine pause";
-            m_search_threads_conductor.Yield();
+            m_search_threads_conductor.AckPause();
             m_search_threads_conductor.Wait();
             VLOG(2) << "SearchRoutine resume";
             if (m_search_threads_conductor.IsTerminate()) {
@@ -884,7 +906,7 @@ void MCTSEngine::InitRoot()
     if (m_config.enable_dirichlet_noise()) {
         TreeNode *ch = m_root->ch;
         int ch_len = m_root->ch_len;
-        float noise[ch_len];
+        float noise[GoComm::GOBOARD_SIZE + 1];
         std::gamma_distribution<float> gamma(m_config.dirichlet_noise_alpha());
         for (int i = 0; i < ch_len; ++i) {
             noise[i] = gamma(g_random_engine);
@@ -893,6 +915,14 @@ void MCTSEngine::InitRoot()
         for (int i = 0; i < ch_len; ++i) {
             ch[i].prior_prob = (1 - m_config.dirichlet_noise_ratio()) * ch[i].prior_prob +
                                 m_config.dirichlet_noise_ratio() * noise[i] / noise_sum;
+        }
+        bool dumb_pass = m_board.GetWinner() != m_board.CurrentPlayer();
+        if (dumb_pass && m_root->value < 0.5 && !m_config.disable_double_pass_scoring()) {
+            for (int i = 0; i < ch_len; ++i) {
+                if (ch[i].move == GoComm::COORD_PASS) {
+                    ch[i].prior_prob = 1e-5f;
+                }
+            }
         }
     }
 }
@@ -929,11 +959,11 @@ int MCTSEngine::GetBestMove(float &v_resign)
 {
     TreeNode *ch = m_root->ch;
     int ch_len = m_root->ch_len;
-    int visit_count[ch_len];
-    float total_action[ch_len];
-    float mean_action[ch_len];
-    float prior_prob[ch_len];
-    float value[ch_len];
+    int visit_count[GoComm::GOBOARD_SIZE + 1];
+    float total_action[GoComm::GOBOARD_SIZE + 1];
+    float mean_action[GoComm::GOBOARD_SIZE + 1];
+    float prior_prob[GoComm::GOBOARD_SIZE + 1];
+    float value[GoComm::GOBOARD_SIZE + 1];
     bool disable_pass = IsPassDisable();
     for (int i = 0; i < ch_len; ++i) {
         if (disable_pass && ch[i].move == GoComm::COORD_PASS) {
@@ -945,7 +975,7 @@ int MCTSEngine::GetBestMove(float &v_resign)
         } else {
             visit_count[i] = ch[i].visit_count;
             total_action[i] = (float)ch[i].total_action / k_action_value_base;
-            mean_action[i] = visit_count[i] == 0 ? 0.0f : total_action[i] / visit_count[i];
+            mean_action[i] = visit_count[i] == 0 ? -1.0f : total_action[i] / visit_count[i];
             prior_prob[i] = ch[i].prior_prob;
             value[i] = ch[i].value;
         }
@@ -987,7 +1017,7 @@ int MCTSEngine::GetSamplingMove(float temperature)
     TreeNode *ch = m_root->ch;
     int ch_len = m_root->ch_len;
     float rtemp = 1.0f / temperature;
-    float probs[ch_len];
+    float probs[GoComm::GOBOARD_SIZE + 1];
     bool disable_pass = IsPassDisable();
     for (int i = 0; i < ch_len; ++i) {
         if (disable_pass && ch[i].move == GoComm::COORD_PASS) {
